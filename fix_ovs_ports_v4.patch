@@ -1,0 +1,119 @@
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 3f5f0bc..68817bd 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -5217,13 +5217,16 @@ class ComputeManager(manager.Manager):
+ 
+     # Begin clouding patch: wait for OVS ports to become ACTIVE during live migration
+     def _wait_for_ports_active(self, context, instance, network_info):
+-        """Wait for OVS ports to be present on the local bridge.
++        """Wait for Neutron ports to be bound to this host.
+ 
+-        Neutron reports ACTIVE before OVS has fully set up the datapath.
+-        This checks the actual OVS port existence via ovs-vsctl.
++        During live migration, Neutron reports ports as ACTIVE because
++        they are still bound to the source host. We poll until
++        binding:host_id matches this (destination) host, meaning the
++        port is truly active on our hypervisor.
+         """
+-        LOG.info(_LI('[clouding] _wait_for_ports_active called'),
+-                 instance=instance)
++        LOG.info(_LI('[clouding] _wait_for_ports_active called, '
++                     'local host: %(host)s'),
++                 {'host': self.host}, instance=instance)
+ 
+         timeout = CONF.vif_plugging_timeout
+         if not timeout:
+@@ -5232,57 +5235,58 @@ class ComputeManager(manager.Manager):
+                      {'t': timeout}, instance=instance)
+             return
+ 
+-        # Build list of OVS port names (qvo + first 11 chars of port UUID)
+-        ovs_ports = []
+-        for vif in network_info:
+-            port_id = vif.get('id')
+-            if port_id:
+-                ovs_port = ("qvo%s" % port_id)[:14]
+-                ovs_ports.append(ovs_port)
+-
+-        if not ovs_ports:
+-            LOG.info(_LI('[clouding] No OVS port names derived, '
++        port_ids = [vif['id'] for vif in network_info if vif.get('id')]
++        if not port_ids:
++            LOG.info(_LI('[clouding] No port IDs found in network_info, '
+                          'skipping port wait'), instance=instance)
+             return
+ 
+-        LOG.info(_LI('[clouding] Waiting for OVS ports on local bridge: '
+-                     '%(ports)s'),
+-                 {'ports': ovs_ports}, instance=instance)
++        LOG.info(_LI('[clouding] Waiting for ports to be bound to '
++                     '%(host)s: %(ports)s'),
++                 {'host': self.host, 'ports': port_ids},
++                 instance=instance)
+ 
+-        poll_interval = 0.5
++        poll_interval = 1
+         elapsed = 0
+         while elapsed < timeout:
+-            all_present = True
+-            for ovs_port in ovs_ports:
++            all_local = True
++            for port_id in port_ids:
+                 try:
+-                    out, _err = utils.execute(
+-                        'ovs-vsctl', '--timeout=2', 'port-to-br',
+-                        ovs_port, run_as_root=True)
+-                    bridge = out.strip() if out else ''
+-                    LOG.info(_LI('[clouding] Port %(port)s found on '
+-                                 'bridge %(br)s'),
+-                             {'port': ovs_port, 'br': bridge},
++                    port_data = self.network_api.show_port(
++                        context, port_id)
++                    port = port_data.get('port', {})
++                    bound_host = port.get('binding:host_id', '')
++                    status = port.get('status', '')
++                    LOG.info(_LI('[clouding] Port %(port)s: status=%(s)s '
++                                 'binding:host_id=%(h)s'),
++                             {'port': port_id, 's': status,
++                              'h': bound_host},
+                              instance=instance)
++                    if bound_host != self.host:
++                        all_local = False
++                        break
+                 except Exception as e:
+-                    all_present = False
+-                    LOG.info(_LI('[clouding] Port %(port)s not yet on '
+-                                 'any bridge: %(err)s'),
+-                             {'port': ovs_port, 'err': e},
+-                             instance=instance)
++                    LOG.warning(_LW('[clouding] Failed to query port '
++                                    '%(port)s: %(err)s'),
++                                {'port': port_id, 'err': e},
++                                instance=instance)
++                    all_local = False
+                     break
+ 
+-            if all_present:
+-                LOG.info(_LI('[clouding] All OVS ports present after '
+-                             '%(elapsed).1f seconds'),
+-                         {'elapsed': elapsed}, instance=instance)
++            if all_local:
++                LOG.info(_LI('[clouding] All ports bound to %(host)s '
++                             'after %(elapsed)d seconds'),
++                         {'host': self.host, 'elapsed': elapsed},
++                         instance=instance)
+                 return
+ 
+             greenthread.sleep(poll_interval)
+             elapsed += poll_interval
+ 
+         LOG.warning(_LW('[clouding] Timed out after %(timeout)d seconds '
+-                        'waiting for OVS ports'),
+-                    {'timeout': timeout}, instance=instance)
++                        'waiting for ports to bind to %(host)s'),
++                    {'timeout': timeout, 'host': self.host},
++                    instance=instance)
+     # End clouding patch
+ 
+     @wrap_exception()
