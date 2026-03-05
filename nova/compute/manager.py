@@ -5215,6 +5215,69 @@ class ComputeManager(manager.Manager):
         LOG.debug('source check data is %s', result)
         return result
 
+    def _wait_for_ports_active(self, context, instance, network_info):
+        """Wait for Neutron ports to become ACTIVE on the destination host.
+
+        During live migration, the OVS port on the destination may not be
+        ready when the VM is transferred. This causes the VM to fail
+        sending GARP/RARP packets, resulting in network timeouts. This
+        method polls Neutron for port status before proceeding with the
+        migration.
+
+        :param context: security context
+        :param instance: instance object being migrated
+        :param network_info: instance network info (list of VIFs)
+        """
+        if not utils.is_neutron():
+            return
+
+        timeout = CONF.vif_plugging_timeout
+        if not timeout:
+            return
+
+        port_ids = [vif['id'] for vif in network_info if vif['id']]
+        if not port_ids:
+            return
+
+        LOG.debug('Waiting for ports to become ACTIVE on destination: %s',
+                  port_ids, instance=instance)
+
+        poll_interval = 1  # seconds
+        elapsed = 0
+        while elapsed < timeout:
+            all_active = True
+            for port_id in port_ids:
+                try:
+                    port_data = self.network_api.show_port(
+                        context, port_id)
+                    port_status = port_data['port'].get('status')
+                    if port_status != 'ACTIVE':
+                        all_active = False
+                        LOG.debug('Port %(port)s is %(status)s, waiting '
+                                  'for ACTIVE',
+                                  {'port': port_id, 'status': port_status},
+                                  instance=instance)
+                        break
+                except Exception:
+                    LOG.warning(_LW('Failed to query port %(port)s status '
+                                    'during live migration'),
+                                {'port': port_id}, instance=instance)
+                    all_active = False
+                    break
+
+            if all_active:
+                LOG.debug('All ports are ACTIVE on destination, proceeding '
+                          'with live migration', instance=instance)
+                return
+
+            greenthread.sleep(poll_interval)
+            elapsed += poll_interval
+
+        LOG.warning(_LW('Timed out waiting for ports to become ACTIVE on '
+                        'destination after %(timeout)d seconds. '
+                        'Proceeding with live migration anyway.'),
+                    {'timeout': timeout}, instance=instance)
+
     @wrap_exception()
     @wrap_instance_event
     @wrap_instance_fault
@@ -5265,6 +5328,12 @@ class ComputeManager(manager.Manager):
         # onto destination host.
         self.driver.ensure_filtering_rules_for_instance(instance,
                                             network_info)
+
+        # NOTE: Wait for Neutron ports to become ACTIVE on the destination
+        # host before proceeding. This ensures the OVS port is fully
+        # plugged so that GARP/RARP packets are sent correctly after the
+        # VM is transferred, preventing network timeouts.
+        self._wait_for_ports_active(context, instance, network_info)
 
         self._notify_about_instance_usage(
                      context, instance, "live_migration.pre.end",
