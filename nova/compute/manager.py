@@ -5215,6 +5215,7 @@ class ComputeManager(manager.Manager):
         LOG.debug('source check data is %s', result)
         return result
 
+    # Begin clouding patch: wait for OVS ports to become ACTIVE during live migration
     def _wait_for_ports_active(self, context, instance, network_info):
         """Wait for Neutron ports to become ACTIVE on the destination host.
 
@@ -5277,6 +5278,7 @@ class ComputeManager(manager.Manager):
                         'destination after %(timeout)d seconds. '
                         'Proceeding with live migration anyway.'),
                     {'timeout': timeout}, instance=instance)
+    # End clouding patch
 
     @wrap_exception()
     @wrap_instance_event
@@ -5329,11 +5331,13 @@ class ComputeManager(manager.Manager):
         self.driver.ensure_filtering_rules_for_instance(instance,
                                             network_info)
 
+        # Begin clouding patch: call port wait before pre_live_migration completes
         # NOTE: Wait for Neutron ports to become ACTIVE on the destination
         # host before proceeding. This ensures the OVS port is fully
         # plugged so that GARP/RARP packets are sent correctly after the
         # VM is transferred, preventing network timeouts.
         self._wait_for_ports_active(context, instance, network_info)
+        # End clouding patch
 
         self._notify_about_instance_usage(
                      context, instance, "live_migration.pre.end",
