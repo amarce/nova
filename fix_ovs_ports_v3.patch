@@ -1,0 +1,100 @@
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index f24ea12..3f5f0bc 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -5217,7 +5217,11 @@ class ComputeManager(manager.Manager):
+ 
+     # Begin clouding patch: wait for OVS ports to become ACTIVE during live migration
+     def _wait_for_ports_active(self, context, instance, network_info):
+-        """Wait for Neutron ports to become ACTIVE on the destination host."""
++        """Wait for OVS ports to be present on the local bridge.
++
++        Neutron reports ACTIVE before OVS has fully set up the datapath.
++        This checks the actual OVS port existence via ovs-vsctl.
++        """
+         LOG.info(_LI('[clouding] _wait_for_ports_active called'),
+                  instance=instance)
+ 
+@@ -5228,42 +5232,48 @@ class ComputeManager(manager.Manager):
+                      {'t': timeout}, instance=instance)
+             return
+ 
+-        port_ids = [vif['id'] for vif in network_info if vif.get('id')]
+-        if not port_ids:
+-            LOG.info(_LI('[clouding] No port IDs found in network_info, '
++        # Build list of OVS port names (qvo + first 11 chars of port UUID)
++        ovs_ports = []
++        for vif in network_info:
++            port_id = vif.get('id')
++            if port_id:
++                ovs_port = ("qvo%s" % port_id)[:14]
++                ovs_ports.append(ovs_port)
++
++        if not ovs_ports:
++            LOG.info(_LI('[clouding] No OVS port names derived, '
+                          'skipping port wait'), instance=instance)
+             return
+ 
+-        LOG.info(_LI('[clouding] Waiting for ports to become ACTIVE: %s'),
+-                 port_ids, instance=instance)
++        LOG.info(_LI('[clouding] Waiting for OVS ports on local bridge: '
++                     '%(ports)s'),
++                 {'ports': ovs_ports}, instance=instance)
+ 
+-        poll_interval = 1
++        poll_interval = 0.5
+         elapsed = 0
+         while elapsed < timeout:
+-            all_active = True
+-            for port_id in port_ids:
++            all_present = True
++            for ovs_port in ovs_ports:
+                 try:
+-                    port_data = self.network_api.show_port(
+-                        context, port_id)
+-                    port_status = port_data.get('port', {}).get('status')
+-                    LOG.info(_LI('[clouding] Port %(port)s status: '
+-                                 '%(status)s'),
+-                             {'port': port_id, 'status': port_status},
++                    out, _err = utils.execute(
++                        'ovs-vsctl', '--timeout=2', 'port-to-br',
++                        ovs_port, run_as_root=True)
++                    bridge = out.strip() if out else ''
++                    LOG.info(_LI('[clouding] Port %(port)s found on '
++                                 'bridge %(br)s'),
++                             {'port': ovs_port, 'br': bridge},
+                              instance=instance)
+-                    if port_status != 'ACTIVE':
+-                        all_active = False
+-                        break
+                 except Exception as e:
+-                    LOG.warning(_LW('[clouding] Failed to query port '
+-                                    '%(port)s: %(err)s'),
+-                                {'port': port_id, 'err': e},
+-                                instance=instance)
+-                    all_active = False
++                    all_present = False
++                    LOG.info(_LI('[clouding] Port %(port)s not yet on '
++                                 'any bridge: %(err)s'),
++                             {'port': ovs_port, 'err': e},
++                             instance=instance)
+                     break
+ 
+-            if all_active:
+-                LOG.info(_LI('[clouding] All ports ACTIVE after '
+-                             '%(elapsed)d seconds'),
++            if all_present:
++                LOG.info(_LI('[clouding] All OVS ports present after '
++                             '%(elapsed).1f seconds'),
+                          {'elapsed': elapsed}, instance=instance)
+                 return
+ 
+@@ -5271,7 +5281,7 @@ class ComputeManager(manager.Manager):
+             elapsed += poll_interval
+ 
+         LOG.warning(_LW('[clouding] Timed out after %(timeout)d seconds '
+-                        'waiting for ports ACTIVE'),
++                        'waiting for OVS ports'),
+                     {'timeout': timeout}, instance=instance)
+     # End clouding patch
+ 
