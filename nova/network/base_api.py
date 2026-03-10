@@ -337,6 +337,19 @@ class NetworkAPI(base.Base):
         """Finish migrating the network of an instance."""
         raise NotImplementedError()
 
+    # Clouding Patch: fix live migration network connectivity loss in
+    # containerized Nova compute. In containerized deployments the OVS agent
+    # does not wire ports whose binding:host_id points to a different host.
+    # This method polls Neutron until all ports are ACTIVE on the destination
+    # before migration starts, ensuring the VM has connectivity on switchover.
+    # The base implementation is a no-op; the Neutron backend overrides it
+    # with actual polling logic. Callers are guarded behind is_neutron() but
+    # this is kept as a safe no-op to avoid crashes if called accidentally.
+    def wait_for_instance_ports_active(self, context, instance, host):
+        """Wait for all instance ports to become ACTIVE on the given host."""
+        pass
+    # End Clouding Patch
+
     def setup_instance_network_on_host(self, context, instance, host):
         """Setup network for specified instance on host.
 

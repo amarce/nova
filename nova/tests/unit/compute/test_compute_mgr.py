@@ -4483,10 +4483,15 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
         compute = manager.ComputeManager()
 
         @mock.patch.object(compute.network_api, 'setup_networks_on_host')
+        # Clouding Patch
+        @mock.patch.object(compute.network_api, 'migrate_instance_finish')
+        @mock.patch('nova.utils.is_neutron', return_value=True)
+        # End Clouding Patch
         @mock.patch.object(compute, '_notify_about_instance_usage')
         @mock.patch.object(compute, '_live_migration_cleanup_flags')
         @mock.patch('nova.objects.BlockDeviceMappingList.get_by_instance_uuid')
-        def _test(mock_bdm, mock_lmcf, mock_notify, mock_nwapi):
+        def _test(mock_bdm, mock_lmcf, mock_notify, mock_is_neutron,
+                  mock_mig_finish, mock_nwapi):
             mock_bdm.return_value = []
             mock_lmcf.return_value = False, False
             compute._rollback_live_migration(self.context,
@@ -4494,6 +4499,12 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
                                              'foo', False, {})
             self.assertIsInstance(mock_lmcf.call_args_list[0][0][0],
                                   migrate_data_obj.LiveMigrateData)
+            # Clouding Patch
+            mock_mig_finish.assert_called_once_with(
+                self.context, mock.ANY,
+                {'source_compute': 'foo',
+                 'dest_compute': compute.host})
+            # End Clouding Patch
 
         _test()
 

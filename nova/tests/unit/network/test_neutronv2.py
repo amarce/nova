@@ -4063,6 +4063,110 @@ class TestNeutronv2Portbinding(TestNeutronv2Base):
             'fake_host', 'setup_instance_network_on_host',
             self.context, instance, 'fake_host')
 
+    # Clouding Patch: tests for wait_for_instance_ports_active which polls
+    # Neutron until ports are ACTIVE on the destination host during live
+    # migration. Covers: immediate success, retry on not-ready status,
+    # timeout, wrong host binding, transient API errors, and no binding
+    # extension scenarios.
+    @mock.patch.object(neutronapi, 'get_client')
+    def test_wait_for_instance_ports_active_immediate(self, mock_get_client):
+        api = neutronapi.API()
+        mock_client = mock.MagicMock()
+        mock_get_client.return_value = mock_client
+        instance = self._fake_instance_object(self.instance)
+        mock_client.list_ports.return_value = {
+            'ports': [{'id': 'port1'}, {'id': 'port2'}]}
+        mock_client.show_port.side_effect = [
+            {'port': {'status': 'ACTIVE', 'binding:host_id': 'dest_host'}},
+            {'port': {'status': 'ACTIVE', 'binding:host_id': 'dest_host'}},
+        ]
+        api._has_port_binding_extension = mock.Mock(return_value=True)
+        api.wait_for_instance_ports_active(self.context, instance, 'dest_host')
+        self.assertEqual(mock_client.show_port.call_count, 2)
+
+    @mock.patch('time.sleep')
+    @mock.patch.object(neutronapi, 'get_client')
+    def test_wait_for_instance_ports_active_retry(self, mock_get_client,
+                                                  mock_sleep):
+        self.flags(live_migration_retry_count=5)
+        api = neutronapi.API()
+        mock_client = mock.MagicMock()
+        mock_get_client.return_value = mock_client
+        instance = self._fake_instance_object(self.instance)
+        mock_client.list_ports.return_value = {
+            'ports': [{'id': 'port1'}]}
+        mock_client.show_port.side_effect = [
+            {'port': {'status': 'BUILD', 'binding:host_id': 'dest_host'}},
+            {'port': {'status': 'ACTIVE', 'binding:host_id': 'dest_host'}},
+        ]
+        api._has_port_binding_extension = mock.Mock(return_value=True)
+        api.wait_for_instance_ports_active(self.context, instance, 'dest_host')
+        mock_sleep.assert_called_once_with(1)
+
+    @mock.patch('time.sleep')
+    @mock.patch.object(neutronapi, 'get_client')
+    def test_wait_for_instance_ports_active_timeout(self, mock_get_client,
+                                                    mock_sleep):
+        self.flags(live_migration_retry_count=3)
+        api = neutronapi.API()
+        mock_client = mock.MagicMock()
+        mock_get_client.return_value = mock_client
+        instance = self._fake_instance_object(self.instance)
+        mock_client.list_ports.return_value = {
+            'ports': [{'id': 'port1'}]}
+        mock_client.show_port.return_value = {
+            'port': {'status': 'BUILD', 'binding:host_id': 'dest_host'}}
+        api._has_port_binding_extension = mock.Mock(return_value=True)
+        self.assertRaises(exception.NovaException,
+                          api.wait_for_instance_ports_active,
+                          self.context, instance, 'dest_host')
+        self.assertEqual(mock_sleep.call_count, 3)
+
+    @mock.patch('time.sleep')
+    @mock.patch.object(neutronapi, 'get_client')
+    def test_wait_for_instance_ports_active_wrong_host(self, mock_get_client,
+                                                       mock_sleep):
+        self.flags(live_migration_retry_count=2)
+        api = neutronapi.API()
+        mock_client = mock.MagicMock()
+        mock_get_client.return_value = mock_client
+        instance = self._fake_instance_object(self.instance)
+        mock_client.list_ports.return_value = {
+            'ports': [{'id': 'port1'}]}
+        mock_client.show_port.return_value = {
+            'port': {'status': 'ACTIVE', 'binding:host_id': 'source_host'}}
+        api._has_port_binding_extension = mock.Mock(return_value=True)
+        self.assertRaises(exception.NovaException,
+                          api.wait_for_instance_ports_active,
+                          self.context, instance, 'dest_host')
+        self.assertEqual(mock_sleep.call_count, 2)
+
+    @mock.patch('time.sleep')
+    @mock.patch.object(neutronapi, 'get_client')
+    def test_wait_for_instance_ports_active_transient_error(
+            self, mock_get_client, mock_sleep):
+        self.flags(live_migration_retry_count=3)
+        api = neutronapi.API()
+        mock_client = mock.MagicMock()
+        mock_get_client.return_value = mock_client
+        instance = self._fake_instance_object(self.instance)
+        mock_client.list_ports.return_value = {
+            'ports': [{'id': 'port1'}]}
+        mock_client.show_port.side_effect = [
+            Exception('Connection aborted'),
+            {'port': {'status': 'ACTIVE', 'binding:host_id': 'dest_host'}}]
+        api._has_port_binding_extension = mock.Mock(return_value=True)
+        api.wait_for_instance_ports_active(self.context, instance, 'dest_host')
+        self.assertEqual(mock_client.show_port.call_count, 2)
+        mock_sleep.assert_called_once_with(1)
+
+    def test_wait_for_instance_ports_active_no_binding_ext(self):
+        api = neutronapi.API()
+        instance = self._fake_instance_object(self.instance)
+        api._has_port_binding_extension = mock.Mock(return_value=False)
+        api.wait_for_instance_ports_active(self.context, instance, 'dest_host')
+    # End Clouding Patch
+
     def test_associate_not_implemented(self):
         api = neutronapi.API()
         self.assertRaises(NotImplementedError,

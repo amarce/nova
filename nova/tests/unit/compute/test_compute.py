@@ -5585,6 +5585,21 @@ class ComputeTestCase(BaseTestCase):
         self.compute.network_api.setup_networks_on_host(c, instance,
                                                         self.compute.host)
 
+        # Clouding Patch
+        self.stubs.Set(utils, 'is_neutron', lambda: True)
+
+        self.mox.StubOutWithMock(self.compute.network_api,
+                                 'migrate_instance_finish')
+        self.compute.network_api.migrate_instance_finish(c, instance,
+            {'source_compute': instance.host,
+             'dest_compute': self.compute.host})
+
+        self.mox.StubOutWithMock(self.compute.network_api,
+                                 'wait_for_instance_ports_active')
+        self.compute.network_api.wait_for_instance_ports_active(c, instance,
+            self.compute.host)
+        # End Clouding Patch
+
         fake_notifier.NOTIFICATIONS = []
         # start test
         self.mox.ReplayAll()
@@ -5917,15 +5932,24 @@ class ComputeTestCase(BaseTestCase):
 
         mock_bdms.return_value = []
 
+        # Clouding Patch
+        @mock.patch('nova.utils.is_neutron', return_value=True)
+        # End Clouding Patch
         @mock.patch.object(self.compute, '_live_migration_cleanup_flags')
         @mock.patch.object(self.compute, 'network_api')
-        def _test(mock_nw_api, mock_lmcf):
+        def _test(mock_nw_api, mock_lmcf, mock_is_neutron):
             mock_lmcf.return_value = False, False
             self.compute._rollback_live_migration(c, instance, 'foo',
                                                   False,
                                                   migrate_data=migrate_data)
             mock_nw_api.setup_networks_on_host.assert_called_once_with(
                 c, instance, self.compute.host)
+            # Clouding Patch
+            mock_nw_api.migrate_instance_finish.assert_called_once_with(
+                c, instance,
+                {'source_compute': 'foo',
+                 'dest_compute': self.compute.host})
+            # End Clouding Patch
         _test()
 
         self.assertEqual('error', migration.status)
@@ -5941,9 +5965,12 @@ class ComputeTestCase(BaseTestCase):
 
         mock_bdms.return_value = []
 
+        # Clouding Patch
+        @mock.patch('nova.utils.is_neutron', return_value=True)
+        # End Clouding Patch
         @mock.patch.object(self.compute, '_live_migration_cleanup_flags')
         @mock.patch.object(self.compute, 'network_api')
-        def _test(mock_nw_api, mock_lmcf):
+        def _test(mock_nw_api, mock_lmcf, mock_is_neutron):
             mock_lmcf.return_value = False, False
             self.compute._rollback_live_migration(c, instance, 'foo',
                                                   False,
@@ -5951,6 +5978,12 @@ class ComputeTestCase(BaseTestCase):
                                                   migration_status='fake')
             mock_nw_api.setup_networks_on_host.assert_called_once_with(
                 c, instance, self.compute.host)
+            # Clouding Patch
+            mock_nw_api.migrate_instance_finish.assert_called_once_with(
+                c, instance,
+                {'source_compute': 'foo',
+                 'dest_compute': self.compute.host})
+            # End Clouding Patch
         _test()
 
         self.assertEqual('fake', migration.status)

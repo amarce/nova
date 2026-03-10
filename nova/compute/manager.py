@@ -5257,6 +5257,25 @@ class ComputeManager(manager.Manager):
         self.network_api.setup_networks_on_host(context, instance,
                                                          self.host)
 
+        # Clouding Patch: fix live migration network connectivity loss in
+        # containerized Nova compute. Move port bindings to destination before
+        # migration starts so the OVS agent wires them, then poll until all
+        # ports are ACTIVE. Without this, the OVS agent on the destination
+        # ignores ports bound to a different host and the VM loses network
+        # after switchover. On failure, _rollback_live_migration reverts
+        # bindings to source unconditionally.
+        # Guarded behind is_neutron() because nova-network's
+        # migrate_instance_finish rebinds floating IPs, which would redirect
+        # traffic before the VM has actually moved.
+        if utils.is_neutron():
+            migration_obj = {'source_compute': instance.host,
+                             'dest_compute': self.host}
+            self.network_api.migrate_instance_finish(context, instance,
+                                                     migration_obj)
+            self.network_api.wait_for_instance_ports_active(context, instance,
+                                                            self.host)
+        # End Clouding Patch
+
         # Creating filters to hypervisors and firewalls.
         # An example is that nova-instance-instance-xxx,
         # which is written to libvirt.xml(Check "virsh nwfilter-list")
@@ -5677,6 +5696,42 @@ class ComputeManager(manager.Manager):
 
         # NOTE(tr3buchet): setup networks on source host (really it's re-setup)
         self.network_api.setup_networks_on_host(context, instance, self.host)
+
+        # Clouding Patch: fix live migration rollback leaving ports bound to
+        # the destination host. Since pre_live_migration now moves port
+        # bindings early (Neutron only), rollback must revert them to source.
+        # This runs on the source host, fixing two bugs:
+        # (1) shared-storage rollback (do_cleanup=False) never called
+        #     rollback_live_migration_at_destination, so ports were never
+        #     rebound to source.
+        # (2) teardown exceptions in rollback_live_migration_at_destination
+        #     skipped migrate_instance_finish because both were in the same
+        #     try block.
+        # Guarded behind is_neutron() because nova-network's
+        # migrate_instance_finish rebinds floating IPs and should not be
+        # called here. Retries once on failure to handle transient Neutron
+        # errors; if both attempts fail, logs at ERROR level since manual
+        # port rebinding may be required.
+        if utils.is_neutron():
+            try:
+                migration_obj = {'source_compute': dest,
+                                 'dest_compute': self.host}
+                self.network_api.migrate_instance_finish(
+                    context, instance, migration_obj)
+            except Exception:
+                LOG.warning(_LW('Failed to revert port bindings to source '
+                                'host, retrying once'),
+                            instance=instance)
+                try:
+                    self.network_api.migrate_instance_finish(
+                        context, instance, migration_obj)
+                except Exception:
+                    LOG.error(_LE('Failed to revert port bindings to '
+                                  'source host after retry. Manual port '
+                                  'rebinding may be required for instance '
+                                  '%(instance)s'),
+                              {'instance': instance.uuid})
+        # End Clouding Patch
 
         bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
                 context, instance.uuid)

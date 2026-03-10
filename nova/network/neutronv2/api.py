@@ -75,6 +75,9 @@ ks_loading.register_auth_conf_options(CONF, NEUTRON_GROUP)
 
 CONF.import_opt('default_floating_pool', 'nova.network.floating_ips')
 CONF.import_opt('flat_injected', 'nova.network.manager')
+# Clouding Patch
+CONF.import_opt('live_migration_retry_count', 'nova.compute.manager')
+# End Clouding Patch
 LOG = logging.getLogger(__name__)
 
 soft_external_network_attach_authorize = extensions.soft_core_authorizer(
@@ -1907,6 +1910,101 @@ class API(base_api.NetworkAPI):
                     with excutils.save_and_reraise_exception():
                         LOG.exception(_LE("Unable to update host of port %s"),
                                       p['id'], instance=instance)
+
+    # Clouding Patch: fix live migration network connectivity loss in
+    # containerized Nova compute.
+    #
+    # Problem: in containerized deployments, the OVS agent on the destination
+    # host does not wire ports whose binding:host_id still points to the
+    # source host. The original code only updated binding:host_id in
+    # post_live_migration_at_destination, which runs AFTER the VM has already
+    # switched over -- leaving it without network connectivity.
+    #
+    # Fix: pre_live_migration now calls migrate_instance_finish to move port
+    # bindings to the destination early, then this method polls Neutron until
+    # all ports report status=ACTIVE and binding:host_id=destination, ensuring
+    # the OVS agent has fully wired them before the memory copy begins.
+    # Transient Neutron API errors (connection resets during rebinding) are
+    # retried up to live_migration_retry_count times.
+    #
+    # Rollback safety: _rollback_live_migration unconditionally reverts port
+    # bindings back to the source host via migrate_instance_finish, fixing:
+    # (1) shared-storage migrations where do_cleanup=False skipped destination
+    #     rollback entirely, leaving ports bound to the wrong host.
+    # (2) teardown exceptions in rollback_live_migration_at_destination that
+    #     skipped port rebinding because both calls were in the same try block.
+    def wait_for_instance_ports_active(self, context, instance, host):
+        """Wait for all instance ports to become ACTIVE on the given host.
+
+        Polls Neutron API until all ports for the instance report status
+        ACTIVE and binding:host_id matches the destination host, ensuring
+        we are checking the port state on the correct hypervisor (not the
+        source). Uses CONF.live_migration_retry_count for timeout.
+
+        :param context: Request context.
+        :param instance: nova.objects.instance.Instance object.
+        :param host: The destination host to verify binding:host_id against.
+        """
+        if not self._has_port_binding_extension(context, refresh_cache=True):
+            return
+        neutron = get_client(context, admin=True)
+        search_opts = {'device_id': instance.uuid,
+                       'tenant_id': instance.project_id}
+
+        max_retry = max(1, CONF.live_migration_retry_count)
+        for retry in range(max_retry):
+            try:
+                data = neutron.list_ports(**search_opts)
+            except Exception:
+                LOG.warning(_LW('Failed to list ports for instance '
+                                '%(instance)s (attempt %(retry)d/%(max)d), '
+                                'retrying'),
+                            {'instance': instance.uuid,
+                             'retry': retry + 1, 'max': max_retry})
+                time.sleep(1)
+                continue
+            port_ids = [p['id'] for p in data['ports']]
+            if not port_ids:
+                return
+
+            all_active = True
+            for port_id in port_ids:
+                try:
+                    p = self._show_port(context, port_id,
+                                        neutron_client=neutron,
+                                        fields=['status', 'binding:host_id'])
+                except Exception:
+                    LOG.warning(_LW('Failed to query port %(port)s: API error '
+                                    '(attempt %(retry)d/%(max)d), retrying'),
+                                {'port': port_id, 'retry': retry + 1,
+                                 'max': max_retry})
+                    all_active = False
+                    break
+                port_host = p.get('binding:host_id')
+                port_status = p.get('status')
+                if port_host != host or port_status != 'ACTIVE':
+                    LOG.debug('Port %(port)s not ready: '
+                              'binding:host_id=%(port_host)s '
+                              '(expected %(host)s), '
+                              'status=%(status)s '
+                              '(attempt %(retry)d/%(max)d)',
+                              {'port': port_id, 'port_host': port_host,
+                               'host': host, 'status': port_status,
+                               'retry': retry + 1, 'max': max_retry})
+                    all_active = False
+                    break
+            if all_active:
+                LOG.info(_LI('All ports for instance %(instance)s are '
+                             'ACTIVE on host %(host)s'),
+                         {'instance': instance.uuid, 'host': host})
+                return
+            time.sleep(1)
+
+        raise exception.NovaException(
+            _('Timed out waiting for ports of instance %(instance)s to '
+              'become ACTIVE on destination host %(host)s') %
+            {'instance': instance.uuid, 'host': host})
+    # End Clouding Patch
 
     def update_instance_vnic_index(self, context, instance, vif, index):
         """Update instance vnic index.
